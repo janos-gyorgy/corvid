@@ -1,0 +1,29 @@
+[Unit]
+# One corvid run. Instance name is the bird: corvid-bird@magpie.service etc.
+# Replaced the user crontab on 2026-08-03 — cron has no catch-up, so the box
+# being powered off on a Saturday morning silently ate three birds (2026-08-01)
+# with no signal anywhere. The timers carry Persistent=true; see them for that.
+Description=corvid agent — %i scheduled run
+Documentation=file:%h/git/corvid/scripts/%i-run.sh
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+EnvironmentFile=%h/.config/corvid/%i.env
+ExecStartPre=/usr/bin/mkdir -p %h/.local/state/corvid-%i
+
+# Shared cross-bird mutex. Persistent=true means every timer missed during a
+# shutdown fires at once on the next boot, and four concurrent claude sessions
+# would race each other into the rate limit. This lock serialises the catch-up;
+# on a normal Saturday the birds are an hour apart and never contend for it.
+# (Each script also takes its OWN non-blocking lock — that one prevents a second
+# copy of the SAME bird; this one orders DIFFERENT birds.)
+ExecStart=/usr/bin/flock /run/user/%U/corvid-fleet.lock %h/git/corvid/scripts/%i-run.sh
+
+# Same destination cron wrote to, so the run history stays in one file.
+StandardOutput=append:%h/.local/state/corvid-%i/cron.log
+StandardError=inherit
+
+# A bird that hangs must not hold the fleet mutex forever.
+TimeoutStartSec=30min

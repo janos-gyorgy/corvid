@@ -1,0 +1,432 @@
+#!/usr/bin/env python3
+"""rookery — the control centre for a corvid agent fleet.
+
+One screen for every bird: when it runs, whether it failed, what it cost, and —
+the part that matters — WHAT IT IS ALLOWED TO REACH. The 2026-07-02 containment
+bug survived ten weeks and two of seven birds kept the broken form, because
+nothing ever *showed* the grant. A control centre that renders the containment
+contract by default makes that class of bug visible instead of archaeological.
+
+Reads only local state — no daemon, no deps, no network:
+  systemctl --user                                 schedule, last result, enabled
+  ~/.local/state/<project>-<bird>/<bird>-*.log     per-run log, cost, guard line
+  <scripts>/<bird>-run.sh                          the DECLARED contract
+  ~/git/<project>-<bird>/quarantine/<bird>/        what it actually found
+
+Also writes ~/.local/state/<project>-fleet.json on every render, so a dashboard
+can show the same view without reimplementing any of the collection.
+
+Usage:
+  rookery              interactive control centre
+  rookery -1/--once    one-shot table, no prompt (also the default when piped)
+  rookery --json       write the status file and exit (for HQ / cron)
+
+Keys:  ↑↓/jk move   r run   d dry-run   l log   e enable/disable   R refresh   q quit
+"""
+from __future__ import annotations
+
+import json
+import os
+import re
+import subprocess
+import sys
+import time
+from datetime import datetime, timezone
+from pathlib import Path
+
+HOME = Path.home()
+SCRIPTS = Path(__file__).resolve().parent
+
+
+def _site(key: str, default: str) -> str:
+    """Read one value out of lib/corvid-site.sh without sourcing bash."""
+    try:
+        txt = (SCRIPTS / "lib" / "corvid-site.sh").read_text()
+    except OSError:
+        return default
+    m = re.search(rf'^{key}=(.+)$', txt, re.M)
+    return m.group(1).strip().strip('"\'') if m else default
+
+
+PROJECT = _site("CORVID_PROJECT", "corvid")
+STATE_FMT = str(HOME / f".local/state/{PROJECT}-{{bird}}")
+WORK_FMT = str(HOME / f"git/{PROJECT}-{{bird}}")
+FLEET_JSON = HOME / f".local/state/{PROJECT}-fleet.json"
+
+# Discovered, not hardcoded — a bird scaffolded with `corvid new` shows up here
+# on its next run without anyone remembering to add it to a list.
+BIRDS = sorted(p.name[:-7] for p in SCRIPTS.glob("*-run.sh"))
+
+# statuses a bird sets on itself; anything not listed reads as trouble
+OK_STATUS = {"ok", "finds", "spark", "pushed", "nothing", "nochanges", "clean", "changed"}
+
+# mirrors corvid_profile() in lib/corvid.sh — so a profile-declared bird still
+# renders its real grant here instead of an unhelpful "?"
+PROFILE_TOOLS = {
+    "untrusted_reader": (["Read", "Glob", "Grep", "Write"], ["Bash"]),
+    "vault_editor":     (["Read", "Edit", "Write", "Bash", "Glob", "Grep"], []),
+}
+
+C = {
+    "dim": "\033[2m", "red": "\033[31m", "grn": "\033[32m", "yel": "\033[33m",
+    "cyn": "\033[36m", "bold": "\033[1m", "rev": "\033[7m", "off": "\033[0m",
+}
+if not sys.stdout.isatty():
+    C = {k: "" for k in C}
+
+
+# ------------------------------------------------------------------ helpers
+def sh(*args: str) -> str:
+    try:
+        return subprocess.run(args, capture_output=True, text=True, timeout=15).stdout.strip()
+    except Exception:
+        return ""
+
+
+def ago(ts: float | None) -> str:
+    if not ts:
+        return "never"
+    s = int(time.time() - ts)
+    if s < 90:
+        return f"{s}s ago"
+    if s < 5400:
+        return f"{s // 60}m ago"
+    if s < 172800:
+        return f"{s // 3600}h ago"
+    return f"{s // 86400}d ago"
+
+
+def until(ts: float | None) -> str:
+    if not ts:
+        return "—"
+    s = int(ts - time.time())
+    if s < 0:
+        return "due"
+    if s < 5400:
+        return f"{s // 60}m"
+    if s < 172800:
+        return f"{s // 3600}h"
+    return f"{s // 86400}d"
+
+
+# ------------------------------------------------------- the declared contract
+def read_contract(bird: str) -> dict:
+    """Parse the bird's own declarations. This is the whole point of the tool:
+    the contract shown here is read from the script, never from memory."""
+    f = SCRIPTS / f"{bird}-run.sh"
+    out = {"tools": [], "deny": [], "mode": "exact", "scope": [], "chassis": False,
+           "profile": None}
+    try:
+        src = f.read_text()
+    except OSError:
+        return out
+    out["chassis"] = "lib/corvid.sh" in src
+
+    # a bird may declare its grant explicitly, or adopt a named profile
+    m = re.search(r"^corvid_profile (\w+)", src, re.M)
+    if m and m.group(1) in PROFILE_TOOLS:
+        out["profile"] = m.group(1)
+        out["tools"], out["deny"] = [list(x) for x in PROFILE_TOOLS[m.group(1)]]
+    m = re.search(r"^CORVID_TOOLS=\(([^)]*)\)", src, re.M)
+    if m:
+        out["tools"] = m.group(1).split()
+    m = re.search(r"^CORVID_DENY=\(([^)]*)\)", src, re.M)
+    if m:
+        out["deny"] = m.group(1).split()
+    m = re.search(r"^CORVID_GUARD_MODE=(\w+)", src, re.M)
+    if m:
+        out["mode"] = m.group(1)
+    m = re.search(r"^CORVID_WRITE_SCOPE=\(([^)]*)\)", src, re.M)
+    if m:
+        raw = m.group(1)
+        for tok in re.findall(r'"([^"]+)"', raw):
+            if tok == "$QFILE":
+                tok = f"quarantine/{bird}/"
+            elif tok == "$SPARKS":
+                sm = re.search(r'^SPARKS="([^"]+)"', src, re.M)
+                tok = sm.group(1) if sm else "$SPARKS"
+            out["scope"].append(tok)
+
+    # a bird still on the old hand-typed flag is the thing we most want to see
+    if not out["tools"] and "--allowedTools" in src:
+        am = re.search(r"--allowedTools\s+([A-Za-z ]+)", src)
+        out["tools"] = am.group(1).split() if am else []
+        out["legacy_flag"] = True
+    return out
+
+
+def contract_line(c: dict) -> tuple[str, bool]:
+    """One-glance containment summary, plus whether it deserves attention."""
+    if c.get("legacy_flag"):
+        return ("⚠ --allowedTools (NO-OP under bypassPermissions)", True)
+    if not c["tools"]:
+        return ("unknown — not on the chassis", True)
+    scope = ", ".join(c["scope"]) or "?"
+    if c["mode"] == "subtree":
+        scope += " ⊂"
+    risky = [t for t in c["tools"] if t in ("Bash", "Edit")]
+    tail = ("Bash+Edit" if len(risky) == 2 else risky[0]) if risky else "no Bash"
+    return (f"{scope} · {tail}", bool(risky))
+
+
+# ---------------------------------------------------------------- systemd
+def timer_info() -> dict:
+    info = {}
+    for ln in sh("systemctl", "--user", "list-timers", "--all", "--no-pager").splitlines():
+        m = re.search(rf"{PROJECT}-(\\w+)\\.timer", ln)
+        if not m:
+            continue
+        info[m.group(1)] = {"raw": ln}
+    return info
+
+
+def unit_state(bird: str) -> dict:
+    out = sh("systemctl", "--user", "show", f"{PROJECT}-agent@{bird}.service",
+             "-p", "Result", "-p", "ExecMainExitTimestamp", "-p", "ActiveState")
+    d = dict(p.split("=", 1) for p in out.splitlines() if "=" in p)
+    enabled = sh("systemctl", "--user", "is-enabled", f"{PROJECT}-{bird}.timer") or "?"
+    nxt = sh("systemctl", "--user", "show", f"{PROJECT}-{bird}.timer",
+             "-p", "NextElapseUSecRealtime", "-p", "LastTriggerUSec")
+    nd = dict(p.split("=", 1) for p in nxt.splitlines() if "=" in p)
+
+    def parse(v: str) -> float | None:
+        v = (v or "").strip()
+        if not v or v in ("n/a", "0"):
+            return None
+        for fmt in ("%a %Y-%m-%d %H:%M:%S %Z", "%a %Y-%m-%d %H:%M:%S"):
+            try:
+                return datetime.strptime(v, fmt).replace(tzinfo=timezone.utc).timestamp()
+            except ValueError:
+                continue
+        return None
+
+    return {
+        "result": d.get("Result", "?"),
+        "enabled": enabled,
+        "last": parse(nd.get("LastTriggerUSec", "")) or parse(d.get("ExecMainExitTimestamp", "")),
+        "next": parse(nd.get("NextElapseUSecRealtime", "")),
+    }
+
+
+def schedule_of(bird: str) -> str:
+    p = HOME / f".config/systemd/user/{PROJECT}-{bird}.timer"
+    try:
+        m = re.search(r"^OnCalendar=(.+)$", p.read_text(), re.M)
+    except OSError:
+        return "—"
+    if not m:
+        return "—"
+    cal = m.group(1).strip()
+    m2 = re.match(r"^(\w{3}) \*-\*-\* (\d{2}:\d{2})", cal)
+    if m2:
+        return f"{m2.group(1)} {m2.group(2)}"
+    m3 = re.match(r"^\*-\*-\* (\d{2}:\d{2})", cal)
+    if m3:
+        return f"daily {m3.group(1)}"
+    return cal[:16]
+
+
+# ------------------------------------------------------------------ run state
+def last_log(bird: str) -> Path | None:
+    d = Path(STATE_FMT.format(bird=bird))
+    logs = sorted(d.glob(f"{bird}-*.log"), key=lambda p: p.stat().st_mtime) if d.is_dir() else []
+    return logs[-1] if logs else None
+
+
+def run_facts(bird: str) -> dict:
+    f = {"cost": None, "status": None, "guard": None, "finds": None}
+    lg = last_log(bird)
+    if not lg:
+        return f
+    try:
+        # NOT a small tail: garden commits a full diff, which pushes the guard
+        # line hundreds of KB above the end of the log.
+        text = lg.read_text(errors="replace")[-2_000_000:]
+    except OSError:
+        return f
+    m = re.findall(r"usage: \$([0-9.]+)", text)
+    if m:
+        f["cost"] = float(m[-1])
+    g = re.findall(r"guard: (clean [^\n]*)", text)
+    if g:
+        f["guard"] = g[-1]
+    if "BLAST RADIUS VIOLATION" in text:
+        f["guard"] = "VIOLATION"
+    m = re.findall(r"proposed (?:quarantine finds|changes) \((\d+)\)", text)
+    if m:
+        f["finds"] = int(m[-1])
+    for pat, st in ((r"FETCH FAILED", "fetchfail"), (r"INCOMPLETE digest", "incomplete"),
+                    (r"successful run", "nothing"), (r"kestrel done", "ok"),
+                    (r"DRY RUN: NOT committing", "dry-run"), (r"^pushed: ", "pushed")):
+        if re.search(pat, text, re.M):
+            f["status"] = st
+    return f
+
+
+def quarantine_count(bird: str) -> int:
+    d = Path(WORK_FMT.format(bird=bird)) / "quarantine" / bird
+    return len(list(d.glob("*.md"))) if d.is_dir() else 0
+
+
+def gather() -> list[dict]:
+    rows = []
+    for b in BIRDS:
+        st = unit_state(b)
+        c = read_contract(b)
+        line, risky = contract_line(c)
+        rf = run_facts(b)
+        rows.append({
+            "bird": b, "schedule": schedule_of(b), "enabled": st["enabled"],
+            "last": st["last"], "next": st["next"], "result": st["result"],
+            "contract": line, "risky": risky, "tools": c["tools"], "deny": c["deny"],
+            "scope": c["scope"], "mode": c["mode"], "chassis": c["chassis"],
+            "legacy_flag": c.get("legacy_flag", False),
+            "cost": rf["cost"], "status": rf["status"], "guard": rf["guard"],
+            "finds": rf["finds"], "quarantined": quarantine_count(b),
+        })
+    return rows
+
+
+def write_fleet_json(rows: list[dict]) -> None:
+    """Same data an HQ panel will want, so the web view never reimplements this."""
+    try:
+        FLEET_JSON.parent.mkdir(parents=True, exist_ok=True)
+        FLEET_JSON.write_text(json.dumps(
+            {"generated": datetime.now(timezone.utc).isoformat(), "birds": rows},
+            indent=2, default=str))
+    except OSError:
+        pass
+
+
+# ------------------------------------------------------------------ rendering
+def health(r: dict) -> tuple[str, str]:
+    if r["guard"] == "VIOLATION":
+        return ("VIOLATION", C["red"])
+    if r["result"] not in ("success", "?", ""):
+        return (r["result"].upper(), C["red"])
+    if r["enabled"] != "enabled":
+        return (r["enabled"], C["yel"])
+    st = r["status"] or "—"
+    return (st, C["grn"] if st in OK_STATUS or st == "dry-run" else C["yel"])
+
+
+def render(rows: list[dict], sel: int, msg: str = "") -> None:
+    print("\033[2J\033[H", end="")
+    risky_n = sum(1 for r in rows if r["risky"])
+    off = [r["bird"] for r in rows if r["enabled"] != "enabled"]
+    print(f"{C['bold']}rookery{C['off']}  ·  {len(rows)} birds  ·  "
+          f"{risky_n} hold Bash/Edit"
+          + (f"  ·  {C['yel']}{len(off)} disabled{C['off']}" if off else ""))
+    print(f"{C['dim']}{'':2}{'BIRD':9}{'SCHEDULE':14}{'LAST':10}{'NEXT':6}"
+          f"{'STATUS':11}{'COST':8}{'CONTAINMENT'}{C['off']}")
+    for i, r in enumerate(rows):
+        st, col = health(r)
+        cur = f"{C['rev']}▸" if i == sel else " "
+        cost = f"${r['cost']:.2f}" if r["cost"] else "—"
+        ccol = C["yel"] if r["risky"] else C["dim"]
+        print(f"{cur} {r['bird']:9}{r['schedule']:14}{ago(r['last']):10}{until(r['next']):6}"
+              f"{col}{st:11}{C['off']}{cost:8}{ccol}{r['contract']}{C['off']}")
+    r = rows[sel]
+    print(f"\n{C['cyn']}── {r['bird']} {C['off']}{C['dim']}"
+          f"{'(chassis)' if r['chassis'] else '(NOT on the chassis)'}{C['off']}")
+    print(f"  tools     {' '.join(r['tools']) or '?'}"
+          + (f"   {C['dim']}deny {' '.join(r['deny'])}{C['off']}" if r["deny"] else ""))
+    print(f"  scope     {', '.join(r['scope']) or '?'}  ({r['mode']})")
+    print(f"  guard     {r['guard'] or '—'}")
+    print(f"  output    {r['finds'] if r['finds'] is not None else '—'} changed last run"
+          f"   ·  {r['quarantined']} file(s) in quarantine")
+    if r["legacy_flag"]:
+        print(f"  {C['red']}⚠ uses --allowedTools, which restricts NOTHING under "
+              f"bypassPermissions{C['off']}")
+    if msg:
+        print(f"\n{msg}")
+    print(f"\n{C['dim']}↑↓/jk move · r run · d dry-run · l log · e enable/disable "
+          f"· R refresh · q quit{C['off']}")
+
+
+# ------------------------------------------------------------------ actions
+def getkey() -> str:
+    import termios, tty
+    fd = sys.stdin.fileno()
+    old = termios.tcgetattr(fd)
+    try:
+        tty.setraw(fd)
+        ch = sys.stdin.read(1)
+        if ch == "\x1b":
+            ch += sys.stdin.read(2)
+        return ch
+    finally:
+        termios.tcsetattr(fd, termios.TCSADRAIN, old)
+
+
+def run_bird(bird: str, dry: bool) -> None:
+    script = SCRIPTS / f"{bird}-run.sh"
+    args = [str(script)] + (["--dry-run"] if dry else [])
+    print(f"\n{C['cyn']}── {' '.join(args)}{C['off']}  (Ctrl-C to abort)\n")
+    env = dict(os.environ)
+    envf = HOME / f".config/{PROJECT}/{bird}.env"
+    if envf.exists():                      # systemd normally supplies these
+        for ln in envf.read_text().splitlines():
+            if "=" in ln and not ln.strip().startswith("#"):
+                k, v = ln.split("=", 1)
+                env.setdefault(k.strip(), v.strip())
+    try:
+        subprocess.run(args, env=env)
+    except KeyboardInterrupt:
+        print("\naborted")
+    input("\n[enter] to return")
+
+
+def main() -> int:
+    argv = sys.argv[1:]
+    rows = gather()
+    write_fleet_json(rows)
+    if "--json" in argv:
+        print(FLEET_JSON)
+        return 0
+    if "-1" in argv or "--once" in argv or not sys.stdout.isatty():
+        render(rows, 0)
+        return 0
+
+    sel, msg = 0, ""
+    while True:
+        render(rows, sel, msg)
+        msg = ""
+        try:
+            k = getkey()
+        except Exception:
+            return 0
+        if k in ("q", "\x03"):
+            print()
+            return 0
+        if k in ("j", "\x1b[B"):
+            sel = (sel + 1) % len(rows)
+        elif k in ("k", "\x1b[A"):
+            sel = (sel - 1) % len(rows)
+        elif k in ("r", "d"):
+            run_bird(rows[sel]["bird"], dry=(k == "d"))
+            rows = gather(); write_fleet_json(rows)
+        elif k == "l":
+            lg = last_log(rows[sel]["bird"])
+            if lg:
+                subprocess.run(["less", "-R", "+G", str(lg)])
+            else:
+                msg = f"{C['yel']}no log yet for {rows[sel]['bird']}{C['off']}"
+        elif k == "e":
+            b = rows[sel]["bird"]
+            on = rows[sel]["enabled"] == "enabled"
+            verb = "disable" if on else "enable"
+            sh("systemctl", "--user", verb, "--now", f"{PROJECT}-{b}.timer")
+            msg = f"{verb}d {PROJECT}-{b}.timer"
+            rows = gather(); write_fleet_json(rows)
+        elif k in ("R", "\x12"):
+            rows = gather(); write_fleet_json(rows)
+            msg = f"{C['dim']}refreshed{C['off']}"
+
+
+if __name__ == "__main__":
+    try:
+        sys.exit(main())
+    except KeyboardInterrupt:
+        print()
+        sys.exit(130)

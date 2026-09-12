@@ -1,0 +1,14 @@
+[Unit]
+Description=corvid corvid — <bird> weekly
+
+[Timer]
+Unit=corvid-agent@<bird>.service
+OnCalendar=Sat *-*-* 09:00:00
+# The whole point of the migration: if the box was off at the scheduled time,
+# run on the next boot instead of silently skipping the week.
+Persistent=true
+# Don't stampede the moment the timer is due.
+AccuracySec=1min
+
+[Install]
+WantedBy=timers.target

@@ -1,0 +1,11 @@
+# corvid-site.sh.example — copy to corvid-site.sh and fill in.
+# Everything instance-specific lives here so lib/corvid.sh stays identical
+# across deployments and can be updated by copying the file.
+
+CORVID_PROJECT=corvid                       # prefixes ~/git/<project>-<bird> and the state dir
+CORVID_REMOTE="git@github.com:you/your-repo.git"   # REQUIRED — where birds push their output
+CORVID_EMAIL_DOMAIN=localhost               # git author domain for bird commits
+CORVID_QDIR_BASE=quarantine                 # output root; keep it out of whatever indexes your repo
+
+# Optional. Called as: <cmd> <qdir> <qfile> before staging, to drop repeats.
+# CORVID_DEDUP_CMD="python3 /path/to/dedup.py"
