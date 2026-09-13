@@ -193,16 +193,106 @@ and were both learned by losing runs:
 
 ---
 
+## Prior art, and where this actually fits
+
+Agent containment is a busy field in 2026 and most of it is doing something
+different from this. Worth being precise about what, because the differences are
+the argument.
+
+| Approach | Examples | The question it answers |
+|---|---|---|
+| **Isolation** | [E2B](https://e2b.dev) (Firecracker), Modal, Daytona, Vercel Sandbox, [microsandbox](https://github.com/microsandbox/microsandbox) (libkrun), gVisor | *Where does the agent run?* |
+| **OS primitives** | Landlock, Seatbelt, bubblewrap; [Nono](https://www.helpnetsecurity.com/2026/07/27/nono-open-source-ai-agent-sandboxing/). Codex CLI and Anthropic's own runtime use these | *What may it touch, enforced by the kernel?* |
+| **Capability monitors** | [PORTICO](https://arxiv.org/abs/2606.22504) — revocable, epoch-bound capabilities behind a reference monitor | *Which authority is still live, and when is it revoked?* |
+| **Injection detection** | [promptfoo](https://promptfoo.dev), [garak](https://github.com/NVIDIA/garak), model-level guardrails | *Is this input trying something?* |
+| **Diff review in CI** | blast-radius and impact-analysis tooling on agent-authored PRs | *Should this change be allowed to merge?* |
+| **corvid** | this | *What actually changed, and does it match the declaration?* |
+
+Rows one to three **prevent**; row four **reviews, with a human waiting**. This
+one **verifies, unattended, and discards**. PORTICO names the distinction in its
+own evaluation — "preventive enforcement rather than post-hoc auditing" — and
+lands on the opposite side of it, which for most systems is the better side.
+
+The case for also checking outcomes is narrow and specific: **prevention is what
+failed here.** The agents ran behind a `--allowedTools` allowlist that reads as a
+restriction and enforces nothing under `bypassPermissions`. Every preventive
+control is a configuration you are trusting to mean what it appears to mean, and
+that one was wrong for three weeks while looking correct in review.
+
+A check on what changed is not immune to being wrong either — it is also code,
+and it has had its own bugs. The difference is narrower than it first sounds and
+worth stating exactly: a preventive control fails **silently and open**, because
+nothing happens when it does not fire. A verification step fails **loudly**, on
+the next run, against a repo you can diff. That is the whole claim. It is also
+why this ships with `corvid verify` rather than asking you to believe it.
+
+PORTICO's "lingering authority" is a good name for the same class of failure —
+authority outliving the reason for it — reached from theory rather than by
+losing three weeks to it.
+
+### Where it overlaps
+
+- **With diff-review tooling**, on mechanism. Both read a diff and assert against
+  a policy. The difference is setting: those tools gate a pull request a human
+  will review, this gates an unattended 04:00 run with nobody watching, and
+  discards rather than flags.
+- **With OS primitives**, on intent. `CORVID_WRITE_SCOPE` and a Landlock write
+  allowlist express the same wish. Landlock enforces it properly; this only
+  notices afterwards. They should be the same declaration — see below.
+- **Not at all with isolation platforms.** Different layer. Run this inside one.
+
+**The conclusion is "both", not "instead".** Nothing here argues against
+prevention — the incident that produced this project argues that prevention alone
+is unfalsifiable in practice, because a control that is not enforcing anything
+looks identical to one that is. Prevent with the kernel, verify the outcome,
+and let the second one tell you when the first stopped working.
+
+### Where it is weaker — read this before adopting it
+
+- **It cannot stop anything.** The write has already happened; the guard only
+  ensures nothing ships. For an agent whose output is files in a repo that is
+  sufficient. It is not "the agent was prevented from acting".
+- **It only sees the working tree.** An agent that writes *outside* the repo is
+  invisible to `git status`. The blast radius asserted here is the repo's, not
+  the machine's — pair it with a real sandbox if that gap matters, which for
+  most people it does.
+- **Effects that are not files escape entirely.** If an agent can send an email,
+  call an API, or post to a webhook, asserting the tree afterwards tells you
+  nothing. The pipeline here keeps the model away from the network precisely
+  because the guard cannot cover it. That is a design constraint, not a feature.
+- **No egress control.** Network isolation is table stakes elsewhere and absent
+  here. The model call itself needs the network, so the honest version needs an
+  allowlisting proxy, and that is its own project.
+- **Single machine, git required.** No orchestration, no multi-node story.
+
+### Where it is genuinely different
+
+- **`--ignored=matching`.** An agent writing a gitignored `.env` is invisible to
+  `git add -A`. Staging-based checks miss it; this does not, and it is a test case.
+- **All-or-nothing taint.** A breach discards the in-scope output too, on the
+  assumption that whatever crossed the boundary may have shaped the rest.
+- **Unattended agents specifically.** Most of this field assumes an interactive
+  coding agent with a human in the loop. These run on timers at 03:00.
+- **The contract is rendered by default.** `rookery` shows every agent's grant on
+  screen, because the ten-week drift happened in a config nobody ever looked at.
+
+### The obvious next step
+
+Generate a Landlock write allowlist from the same `CORVID_WRITE_SCOPE` the guard
+asserts. One declaration, enforced by the kernel *and* verified afterwards — and
+it would close the "only sees the working tree" hole above. Not built yet.
+
+---
+
 ## What this is not
 
 - **Not a sandbox.** It does not stop an agent acting; it stops the result of a
-  boundary breach from shipping. Pair it with whatever isolation you want —
-  they answer different questions.
-- **Not injection detection.** It never asks whether the input was malicious. It
-  asks what changed on disk. That is why it holds against attacks nobody has
-  thought of yet.
-- **Not an agent framework.** There is no orchestration, no memory, no planner.
-  It runs one model call between two wrapper-owned steps, and checks the damage.
+  boundary breach from shipping. Pair it with real isolation.
+- **Not injection detection.** It never asks whether the input was malicious, only
+  what changed on disk — which is why it holds against attacks nobody has thought
+  of yet, and why it tells you nothing about effects that are not files.
+- **Not an agent framework.** No orchestration, no memory, no planner. One model
+  call between two wrapper-owned steps, and a check on the damage.
 
 ## Requirements
 
