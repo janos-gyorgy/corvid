@@ -195,9 +195,11 @@ and were both learned by losing runs:
 
 ## Prior art, and where this actually fits
 
-Agent containment is a busy field in 2026 and most of it is doing something
-different from this. Worth being precise about what, because the differences are
-the argument.
+**What this is, stated plainly: a git working-tree integrity guard for unattended,
+repo-only agents.** Not "the missing verification half of agent security" — that
+would be a much bigger claim than 250 lines of bash earns. Everything below is
+about which neighbouring problem each tool solves, because the boundaries matter
+more than the category.
 
 | Approach | Examples | The question it answers |
 |---|---|---|
@@ -208,8 +210,10 @@ the argument.
 | **Diff review in CI** | blast-radius and impact-analysis tooling on agent-authored PRs | *Should this change be allowed to merge?* |
 | **corvid** | this | *What actually changed, and does it match the declaration?* |
 
-Rows one to three **prevent**; row four **reviews, with a human waiting**. This
-one **verifies, unattended, and discards**. PORTICO names the distinction in its
+Isolation, OS primitives and capability monitors all **prevent**. Injection
+detection **classifies the input**. Diff-review tooling **reviews an outcome with
+a human waiting**. This one **verifies an outcome unattended, and discards**.
+PORTICO names the prevent/verify distinction in its
 own evaluation — "preventive enforcement rather than post-hoc auditing" — and
 lands on the opposite side of it, which for most systems is the better side.
 
@@ -219,12 +223,18 @@ restriction and enforces nothing under `bypassPermissions`. Every preventive
 control is a configuration you are trusting to mean what it appears to mean, and
 that one was wrong for three weeks while looking correct in review.
 
-A check on what changed is not immune to being wrong either — it is also code,
-and it has had its own bugs. The difference is narrower than it first sounds and
-worth stating exactly: a preventive control fails **silently and open**, because
-nothing happens when it does not fire. A verification step fails **loudly**, on
-the next run, against a repo you can diff. That is the whole claim. It is also
-why this ships with `corvid verify` rather than asking you to believe it.
+It is tempting to conclude "prevention is unfalsifiable", and that would be
+wrong. Prevention is perfectly testable — with denied-write probes, denied-network
+probes, negative policy tests, sandbox denial logs. The honest lesson from that
+incident is narrower and less flattering: **the preventive control here was never
+tested, and an untested control is indistinguishable from a working one.**
+
+So the actual claim is modest. This treats prevention as fallible configuration
+and adds an independently implemented post-condition: after the run, the working
+tree must contain only declared changes, including ignored files. It does not
+make execution safe. It makes unauthorised repo mutations detectable and
+discardable — and it ships `corvid verify` so the check itself is tested, which
+is the same discipline the failed control lacked.
 
 PORTICO's "lingering authority" is a good name for the same class of failure —
 authority outliving the reason for it — reached from theory rather than by
@@ -239,7 +249,9 @@ losing three weeks to it.
 - **With OS primitives**, on intent. `CORVID_WRITE_SCOPE` and a Landlock write
   allowlist express the same wish. Landlock enforces it properly; this only
   notices afterwards. They should be the same declaration — see below.
-- **Not at all with isolation platforms.** Different layer. Run this inside one.
+- **With isolation platforms**, only indirectly. Different layer, but overlapping
+  concerns — filesystem mutation scope, rollback, egress, credential exposure.
+  This is not a substitute for one. Run it inside one.
 
 **The conclusion is "both", not "instead".** Nothing here argues against
 prevention — the incident that produced this project argues that prevention alone
@@ -264,23 +276,45 @@ and let the second one tell you when the first stopped working.
   here. The model call itself needs the network, so the honest version needs an
   allowlisting proxy, and that is its own project.
 - **Single machine, git required.** No orchestration, no multi-node story.
+- **Whole classes of effect are out of scope**, and a 2026 reader should assume
+  they are unhandled here: MCP and other tool servers, delegated CLIs running with
+  their own privileges, ambient credentials (SSH agent, cloud config, kubeconfig,
+  Docker socket, registry tokens), and supply-chain paths like install scripts or
+  generated CI changes. "The working tree matches the declaration" says nothing
+  about any of them. The pipeline compensates by giving the model no shell, no
+  network and no MCP — a narrow diet, not a general answer.
+- **Inside `.git`, only hooks, config and info are sealed.** Objects, refs and the
+  index are not hashed: they are content-addressed and git validates them itself,
+  and hashing an object store every run costs more than the risk warrants. Nested
+  repos, submodules and worktrees are not specifically handled.
 
-### Where it is genuinely different
+### What this wrapper specifically enforces
 
 - **`--ignored=matching`.** An agent writing a gitignored `.env` is invisible to
   `git add -A`. Staging-based checks miss it; this does not, and it is a test case.
+- **`.git` is sealed across the model call.** `git status` reports nothing inside
+  `.git`, so an agent holding only a Write tool could plant `.git/hooks/post-commit`
+  and have it execute during the commit the wrapper runs next — with the wrapper's
+  push credentials. Hooks, config and info are hashed before the model runs and
+  re-checked after; a mismatch discards the run and marks the checkout poisoned,
+  so it is re-cloned rather than reused (`git clean` does not remove files under
+  `.git`). Two test cases. **This bug was found by an adversarial review of this
+  README, not by the tests — which is the honest argument for having both.**
 - **All-or-nothing taint.** A breach discards the in-scope output too, on the
   assumption that whatever crossed the boundary may have shaped the rest.
-- **Unattended agents specifically.** Most of this field assumes an interactive
-  coding agent with a human in the loop. These run on timers at 03:00.
+- **Unattended, all-or-nothing.** Headless agents are common enough by now that
+  this is not a differentiator on its own; the operational choice is that there
+  is no human to escalate to at 03:00, so the only options are ship or discard.
 - **The contract is rendered by default.** `rookery` shows every agent's grant on
   screen, because the ten-week drift happened in a config nobody ever looked at.
 
 ### The obvious next step
 
 Generate a Landlock write allowlist from the same `CORVID_WRITE_SCOPE` the guard
-asserts. One declaration, enforced by the kernel *and* verified afterwards — and
-it would close the "only sees the working tree" hole above. Not built yet.
+asserts. One declaration, enforced by the kernel *and* verified afterwards. That
+would narrow the out-of-repo **filesystem write** hole on Linux — it would not
+touch network effects, credential exposure, delegated tools with their own
+privileges, or macOS. Not built yet.
 
 ---
 
@@ -289,8 +323,9 @@ it would close the "only sees the working tree" hole above. Not built yet.
 - **Not a sandbox.** It does not stop an agent acting; it stops the result of a
   boundary breach from shipping. Pair it with real isolation.
 - **Not injection detection.** It never asks whether the input was malicious, only
-  what changed on disk — which is why it holds against attacks nobody has thought
-  of yet, and why it tells you nothing about effects that are not files.
+  what changed on disk. That makes it indifferent to *how* a repo mutation was
+  achieved — but only to repo mutations. Effects that are not files in the working
+  tree are outside the claim entirely.
 - **Not an agent framework.** No orchestration, no memory, no planner. One model
   call between two wrapper-owned steps, and a check on the damage.
 

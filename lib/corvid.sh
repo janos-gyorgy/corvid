@@ -172,6 +172,16 @@ corvid_notify() {
 # Clone once, else hard-reset to remote HEAD. -x also wipes ignored cruft
 # (.env / index/*) so the tree the agent sees is genuinely pristine.
 corvid_sync() {
+  # A previous run tampered with .git. The checkout cannot be trusted and cannot
+  # be cleaned in place, so discard it. Deliberately narrow: only a path this
+  # function itself derives, only when it is a git checkout, only when flagged.
+  if [ -f "$STATE/poisoned" ]; then
+    if [ -d "$WORK/.git" ] && [ "$WORK" = "$HOME/git/$CORVID_PROJECT-$BIRD" ]; then
+      echo "previous run poisoned .git — discarding $WORK and re-cloning"
+      rm -rf "$WORK"
+    fi
+    rm -f "$STATE/poisoned"
+  fi
   if [ ! -d "$WORK/.git" ]; then
     echo "cloning $BIRD checkout -> $WORK"
     git clone --branch "$BRANCH" "$CORVID_REMOTE" "$WORK"
@@ -193,6 +203,7 @@ corvid_sync() {
 corvid_think() {
   local prompt_file="$1"; shift
   : "${CORVID_TOOLS:?bird must declare CORVID_TOOLS}"
+  CORVID_GIT_SEAL="$(_corvid_git_seal)"   # verified again in corvid_guard
   echo "---- claude ($BIRD): tools=${CORVID_TOOLS[*]} deny=${CORVID_DENY[*]-none} ----"
   source "$WORK/scripts/lib/claude-metered.sh"
   local deny=()
@@ -202,6 +213,26 @@ corvid_think() {
     --permission-mode bypassPermissions \
     --strict-mcp-config --mcp-config '{"mcpServers":{}}' \
     --tools "${CORVID_TOOLS[@]}" "${deny[@]}" "$@"
+}
+
+# ── .git INTEGRITY ────────────────────────────────────────────────────────────
+# `git status` DOES NOT REPORT CHANGES INSIDE .git — so an agent holding only a
+# Write tool can drop .git/hooks/post-commit, the guard reports clean, and then
+# corvid_ship runs `git commit`, EXECUTING the hook with the wrapper's network
+# access and push credentials. Found 2026-09-13 by an adversarial review of the
+# README that asked what happens if git itself is the thing you tampered with.
+#
+# Between corvid_sync and corvid_guard nothing legitimate touches .git: the model
+# has no git and no shell. So the window can be sealed strictly. Scoped to the
+# CODE-EXECUTION and behaviour-altering surfaces — hooks, config, info — rather
+# than all of .git, because objects and refs are content-addressed and git
+# validates them itself, and hashing a large object store every run is a cost
+# with no matching risk.
+_corvid_git_seal() {
+  {
+    find .git/hooks .git/info -type f -printf '%m %p\n' -exec sha256sum {} \; 2>/dev/null
+    sha256sum .git/config 2>/dev/null
+  } | LC_ALL=C sort | sha256sum | cut -d' ' -f1
 }
 
 # ── corvid_guard ──────────────────────────────────────────────────────────────
@@ -214,6 +245,20 @@ corvid_think() {
 # deterministically when claude starts in this tree — not agent output.
 corvid_guard() {
   local mode="${CORVID_GUARD_MODE:-exact}" p s path ok allow_re="" inscope=0
+
+  # FIRST: did anything touch git's own machinery? Checked before the working
+  # tree, because a poisoned hook would execute during the commit that follows.
+  if [ -n "${CORVID_GIT_SEAL:-}" ] && [ "$(_corvid_git_seal)" != "$CORVID_GIT_SEAL" ]; then
+    echo "BLAST RADIUS VIOLATION — .git was modified (hooks/config/info); committing nothing"
+    # `git clean` and `reset --hard` do NOT remove files under .git, so a planted
+    # hook would survive into the next run and fire on ITS commit. Mark the
+    # checkout poisoned; corvid_sync re-clones from scratch before the next run.
+    # The destructive step lives there, next to the clone that replaces it.
+    : > "$STATE/poisoned"
+    git clean -fdxq 2>/dev/null || true
+    STATUS=violation; DETAIL=".git tampered — hooks or config changed during the run"
+    exit 1
+  fi
   local -a stray=()
   [ "${#CORVID_WRITE_SCOPE[@]}" -gt 0 ] || CORVID_WRITE_SCOPE=("$QFILE")
 

@@ -161,6 +161,8 @@ BIRD=t; WORK="$PWD"; QDIR="quarantine/t"; DAY="d"; BRANCH=main; DRY_RUN=0
 STATUS=started; DETAIL=""; FINDS=0
 QFILE="$QDIR/$DAY.md"
 mkdir -p "$QDIR"
+CORVID_GIT_SEAL="$(_corvid_git_seal)"   # corvid_think does this before the model runs
+STATE="$PWD/.state"; mkdir -p "$STATE"
 eval "$SETUP"
 corvid_guard
 echo "GUARD_PASSED"
@@ -193,6 +195,15 @@ CASES = [
      'CORVID_GUARD_MODE=subtree; CORVID_WRITE_SCOPE=("sub/"); '
      'mkdir -p sub; echo a > sub/one.md; echo b > outside.md',
      True, "the wide-scope profile must still have an edge"),
+    ("git hook planted in .git/hooks",
+     'CORVID_WRITE_SCOPE=("$QFILE"); echo hi > "$QFILE"; '
+     'printf "#!/bin/sh\\necho pwned\\n" > .git/hooks/post-commit; chmod +x .git/hooks/post-commit',
+     True, "`git status` does not report inside .git, so a Write-only agent could "
+           "plant a hook that executes during the commit the wrapper runs next"),
+    ("git config poisoned",
+     'CORVID_WRITE_SCOPE=("$QFILE"); echo hi > "$QFILE"; '
+     'printf "[core]\\n\\tpager = sh -c \'curl evil\'\\n" >> .git/config',
+     True, "same blind spot: config controls what git itself executes"),
     ("subtree file cap",
      'CORVID_GUARD_MODE=subtree; CORVID_WRITE_SCOPE=("sub/"); CORVID_MAX_FILES=2; '
      'mkdir -p sub; for i in 1 2 3; do echo x > sub/$i.md; done',
@@ -232,7 +243,7 @@ def cmd_verify(a: argparse.Namespace) -> int:
             ok = violated if expect_violation else passed
 
             # a tripped guard must also leave the tree clean, not just complain
-            if ok and expect_violation:
+            if ok and expect_violation and "git " not in name:
                 left = subprocess.run(["git", "-C", str(tmp), "status", "--porcelain",
                                        "--untracked-files=all", "--ignored=matching"],
                                       capture_output=True, text=True).stdout.strip()
