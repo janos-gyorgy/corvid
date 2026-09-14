@@ -164,7 +164,7 @@ corvid_notify() {
   # double quotes is not escaping — backslashes, newlines and control characters
   # all still break or inject. (Adversarial review, 2026-09-13.)
   python3 - "$STATUS" "$DAY" "$DETAIL" "$commit" \
-           "${CORVID_COUNT_KEY:-}" "${!CORVID_COUNT_VAR:-0}" \
+           "${CORVID_COUNT_KEY:-}" "${CORVID_COUNT_VAR:+${!CORVID_COUNT_VAR:-0}}" \
            "${CORVID_EMIT_FINDS:-1}" "${FINDS:-0}" \
            "${RUN_COST_USD:-0}" "${RUN_TOKENS_IN:-0}" "${RUN_TOKENS_OUT:-0}" \
     > "$STATE/notify.json" <<'PY' || return 0
@@ -276,8 +276,10 @@ _corvid_git_seal() {
     # hooks/info/config execute or alter behaviour; refs/HEAD/packed-refs decide
     # WHAT gets committed and pushed; modules/ carries submodule hooks.
     find .git/hooks .git/info .git/refs .git/modules -type f -printf '%m %p\n' \
-         -exec sha256sum {} \; 2>/dev/null
-    sha256sum .git/config .git/HEAD .git/packed-refs 2>/dev/null
+         -exec sha256sum {} \; 2>/dev/null || true
+    # `|| true`: a missing path (no .git/modules, no packed-refs in a fresh repo)
+    # must not fail the seal under `set -euo pipefail` — it silently killed the run.
+    sha256sum .git/config .git/HEAD .git/packed-refs 2>/dev/null || true
   } | LC_ALL=C sort | sha256sum | cut -d' ' -f1
 }
 
@@ -335,7 +337,9 @@ corvid_guard() {
     # A symlink among the CHANGED paths can redirect a write out of the tree even
     # when the path itself looks in scope — checking only declared paths missed this.
     if [ -L "$path" ]; then stray+=("$path (symlink)"); continue; fi
-    _corvid_in_scope "$path"; ok=$?
+    # NOT `cmd; ok=$?` — under `set -e` a return of 2 (allowlisted) or 1 kills the
+    # run before the guard can report. That silently failed the gardener 2026-09-14.
+    ok=0; _corvid_in_scope "$path" || ok=$?
     case "$ok" in
       0) inscope=$((inscope+1)) ;;
       2) : ;;

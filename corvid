@@ -154,7 +154,9 @@ WantedBy=timers.target
 
 
 HARNESS = r"""
-set -uo pipefail
+# -e on purpose: real agents run under `set -euo pipefail`. Without it this harness
+# passed a guard that killed the gardener on a return-2 allowlist hit (2026-09-14).
+set -euo pipefail
 export HOME="${HOME:?}"
 CORVID_REMOTE=test://none   # required by the chassis; never used, we do not sync here
 source "$CHASSIS"
