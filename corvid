@@ -208,6 +208,17 @@ CASES = [
      'CORVID_WRITE_SCOPE=("$QFILE"); echo hi > "$QFILE"; '
      'printf "[core]\\n\\tpager = sh -c \'curl evil\'\\n" >> .git/config',
      True, "same blind spot: config controls what git itself executes"),
+    ("ignored directory is judged file by file",
+     'CORVID_WRITE_SCOPE=("$QFILE"); CORVID_SCOPE_ALLOW=(\'(^|/)__pycache__/[^/]*\\.pyc$\'); '
+     'echo hi > "$QFILE"; mkdir -p pkg/__pycache__; echo x > pkg/__pycache__/m.cpython-312.pyc',
+     False, "git collapses a wholly-ignored dir to `dir/`; a file allowlist must still "
+            "match the files in it (killed the gardener 2026-09-14)"),
+    ("file hidden in an ignored directory",
+     'CORVID_WRITE_SCOPE=("$QFILE"); CORVID_SCOPE_ALLOW=(\'(^|/)__pycache__/[^/]*\\.pyc$\'); '
+     'echo hi > "$QFILE"; mkdir -p pkg/__pycache__; echo x > pkg/__pycache__/m.cpython-312.pyc; '
+     'echo evil > pkg/__pycache__/payload.sh',
+     True, "judging the collapsed directory by its files must not become a way to "
+           "smuggle a non-allowlisted file past the guard"),
     ("subtree scope is a path boundary, not a prefix",
      'CORVID_GUARD_MODE=subtree; CORVID_WRITE_SCOPE=("sub"); '
      'mkdir -p sub sub-evil; echo a > sub/ok.md; echo b > sub-evil/x.md',
@@ -244,7 +255,7 @@ def cmd_verify(a: argparse.Namespace) -> int:
         try:
             subprocess.run(["git", "init", "-q", "-b", "main", str(tmp)], check=True)
             (tmp / "README.md").write_text("seed\n")
-            (tmp / ".gitignore").write_text(".env\n")
+            (tmp / ".gitignore").write_text(".env\n__pycache__/\n")
             subprocess.run(["git", "-C", str(tmp), "add", "-A"], check=True)
             subprocess.run(["git", "-C", str(tmp), "-c", "user.email=t@t",
                             "-c", "user.name=t", "commit", "-qm", "seed"], check=True)

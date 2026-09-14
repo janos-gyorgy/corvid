@@ -283,6 +283,25 @@ _corvid_git_seal() {
   } | LC_ALL=C sort | sha256sum | cut -d' ' -f1
 }
 
+# ── _corvid_guard_one <path> ─────────────────────────────────────────────────
+# Classify ONE changed path for corvid_guard. Updates the caller's `inscope` and
+# `stray` (bash dynamic scope), so a directory expansion and a plain path go
+# through exactly the same test.
+_corvid_guard_one() {
+  local path="$1" ok
+  # A symlink among the CHANGED paths can redirect a write out of the tree even
+  # when the path itself looks in scope — checking only declared paths missed this.
+  if [ -L "${path%/}" ]; then stray+=("$path (symlink)"); return 0; fi
+  # NOT `cmd; ok=$?` — under `set -e` a return of 2 (allowlisted) or 1 kills the
+  # run before the guard can report. That silently failed the gardener 2026-09-14.
+  ok=0; _corvid_in_scope "$path" || ok=$?
+  case "$ok" in
+    0) inscope=$((inscope+1)) ;;
+    2) : ;;
+    *) stray+=("$path") ;;
+  esac
+}
+
 # ── corvid_guard ──────────────────────────────────────────────────────────────
 # BLAST RADIUS ENFORCEMENT — the security boundary of the whole fleet, and the
 # reason this file exists. ONLY $QFILE may change: tracked, untracked OR ignored.
@@ -334,17 +353,19 @@ corvid_guard() {
       fi
       continue
     fi
-    # A symlink among the CHANGED paths can redirect a write out of the tree even
-    # when the path itself looks in scope — checking only declared paths missed this.
-    if [ -L "$path" ]; then stray+=("$path (symlink)"); continue; fi
-    # NOT `cmd; ok=$?` — under `set -e` a return of 2 (allowlisted) or 1 kills the
-    # run before the guard can report. That silently failed the gardener 2026-09-14.
-    ok=0; _corvid_in_scope "$path" || ok=$?
-    case "$ok" in
-      0) inscope=$((inscope+1)) ;;
-      2) : ;;
-      *) stray+=("$path") ;;
-    esac
+    # `--ignored=matching` collapses a wholly-ignored directory to "dir/". Judge
+    # every file inside it, not the directory name: otherwise an allowlist written
+    # for files (`__pycache__/*.pyc`) refuses the directory, and a directory-level
+    # allowlist would wave through anything hidden in it. (Gardener, 2026-09-14.)
+    if [[ "$path" == */ ]] && [ -d "${path%/}" ] && [ ! -L "${path%/}" ]; then
+      local f n=0
+      while IFS= read -r -d '' f; do
+        n=$((n+1)); _corvid_guard_one "$f"
+      done < <(find "${path%/}" -mindepth 1 ! -type d -print0)
+      [ "$n" -gt 0 ] || _corvid_guard_one "$path"   # empty dir: judge the name
+      continue
+    fi
+    _corvid_guard_one "$path"
   done < <(git status --porcelain --untracked-files=all --ignored=matching | cut -c4-)
 
   if [ "${#stray[@]}" -gt 0 ]; then
