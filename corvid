@@ -85,6 +85,7 @@ SCRIPT_DIR="$(cd "$(dirname "${{BASH_SOURCE[0]}}")" && pwd)"
 source "$SCRIPT_DIR/lib/corvid.sh"
 
 corvid_profile {profile}
+CORVID_TIER=standard           # model tier: light|standard|top -> lib/models.sh
 CORVID_COUNT_KEY="items"       # name of the count field in the n8n payload
 CORVID_COUNT_VAR="NITEMS"
 {extra}

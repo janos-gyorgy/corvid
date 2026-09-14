@@ -18,6 +18,7 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 source "$SCRIPT_DIR/lib/corvid.sh"
 
 corvid_profile untrusted_reader
+CORVID_TIER=standard           # model tier: light|standard|top -> lib/models.sh
 CORVID_COUNT_KEY="items"
 CORVID_COUNT_VAR="NITEMS"
 NITEMS=0

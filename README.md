@@ -126,6 +126,32 @@ mean something.
 A profile is a starting posture, not a cage — override any value after calling it.
 What it prevents is an agent quietly ending up with a grant nobody chose.
 
+## Model tiers
+
+An agent names a **tier**, never a model:
+
+```bash
+CORVID_TIER=standard     # light | standard | top
+```
+
+`lib/models.sh` is the only file that names models, and it names family
+**aliases** (`haiku`, `sonnet`, `best`), never full model IDs. An alias resolves
+to the newest model in its family at run time, so a release moves the fleet
+forward without anyone editing anything. A pinned ID does not: this fleet once
+stopped mid-run on a spend limit with a premium pin, and later sat a whole model
+generation behind on a pin nobody re-checked.
+
+Aliases survive new versions, not renames. If a family is renamed or retired,
+you edit `lib/models.sh` and nothing else. Meanwhile every call carries
+`--fallback-model`, so runs keep going, and a run that lands on a different
+family than it asked for warns on stderr and pings `CORVID_NTFY_URL` if set. A
+silent fallback would just be the pinned-ID problem again, harder to see.
+
+Without a tier an agent inherits the CLI default, which is whatever the operator
+set for their own interactive sessions. That default silently moving every agent
+is why tiers exist. The usage ledger records the model a run actually used next
+to the one it asked for.
+
 ---
 
 ## `corvid verify`

@@ -7,5 +7,9 @@ CORVID_REMOTE="git@github.com:you/your-repo.git"   # REQUIRED — where birds pu
 CORVID_EMAIL_DOMAIN=localhost               # git author domain for bird commits
 CORVID_QDIR_BASE=quarantine                 # output root; keep it out of whatever indexes your repo
 
+# Optional. ntfy topic URL for fleet-plumbing warnings (a run landed on a
+# different model family than its CORVID_TIER asked for). Unset = stderr only.
+# CORVID_NTFY_URL=https://ntfy.sh/your-private-topic
+
 # Optional. Called as: <cmd> <qdir> <qfile> before staging, to drop repeats.
 # CORVID_DEDUP_CMD="python3 /path/to/dedup.py"
