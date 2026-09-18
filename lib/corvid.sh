@@ -196,9 +196,13 @@ PY
 # body carries the run detail, the finds count, the cost in USD and the last
 # commit line. Priority: a status OUTSIDE the OK set (a failed run) is high with
 # a warning tag; a run that changed nothing is low; anything with finds is the
-# default. Optional CORVID_NTFY_TOKEN is sent as a Bearer token and is never
-# echoed. Best-effort and non-blocking exactly like the n8n post above: 10s
-# timeout, errors ignored, so a notification can never fail or slow the run.
+# default. ntfy reads Title, Priority and Tags from HTTP headers, not the body,
+# so they go out as curl headers and the body is plain text (the same shape
+# _claude_metered_mismatch already uses; a JSON body would only be parsed when
+# posted to the server root with a "topic" field, which we do not do). Optional
+# CORVID_NTFY_TOKEN is sent as a Bearer token and is never echoed. Best-effort
+# and non-blocking exactly like the n8n post above: 10s timeout, errors ignored,
+# so a notification can never fail or slow the run.
 corvid_ntfy_notify() {
   [ -n "${CORVID_NTFY_URL:-}" ] || return 0
   local st="${STATUS:-failed}" commit prio="default" tags=""
@@ -209,12 +213,13 @@ corvid_ntfy_notify() {
   esac
   case "$st" in nothing|nochanges) prio="low" ;; esac
   commit="$(git -C "$WORK" --no-pager log --oneline -1 2>/dev/null || echo n/a)"
-  # DETAIL can hold model-chosen text, so the body and title go through a JSON
-  # encoder rather than being pasted together (same discipline as corvid_notify).
+  # DETAIL can hold model-chosen text, so the body is built by a JSON encoder
+  # into a plain-text file rather than pasting strings into the request, while
+  # headers keep newlines stripped (same discipline as corvid_notify).
   python3 - "$BIRD" "$st" "$DETAIL" "${FINDS:-0}" "${RUN_COST_USD:-0}" \
-           "$commit" "$prio" "$tags" > "$STATE/ntfy.json" <<'PY' || return 0
-import json, sys
-bird, st, detail, finds, cost, commit, prio, tags = sys.argv[1:9]
+           "$commit" > "$STATE/ntfy.json" <<'PY' || return 0
+import sys
+bird, st, detail, finds, cost, commit = sys.argv[1:7]
 def num(v):
     v = str(v).strip()
     try:
@@ -226,18 +231,20 @@ bits.append("finds: {0}".format(num(finds)))
 bits.append("cost: ${0}".format(num(cost)))
 if commit and commit != "n/a":
     bits.append(commit)
-p = {"title": "{0}: {1}".format(bird, st), "message": "\n".join(bits),
-     "priority": prio}
-if tags:
-    p["tags"] = [tags]
-json.dump(p, sys.stdout)
+sys.stdout.write("\n".join(bits))
 PY
-  local auth=()
+  # Header values must never contain a newline: curl would pass it through and
+  # let a title, priority or tag split into a second header line.
+  local ntfy_title ntfy_tags auth=()
+  ntfy_title="$(printf '%s' "$BIRD: $st" | tr -d '\r\n')"
+  ntfy_tags="$(printf '%s' "$tags" | tr -d '\r\n')"
   if [ -n "${CORVID_NTFY_TOKEN:-}" ]; then
     auth=(-H "Authorization: Bearer $CORVID_NTFY_TOKEN")
   fi
-  curl -fsS -m 10 -X POST "$CORVID_NTFY_URL" -H 'Content-Type: application/json' \
-    "${auth[@]}" --data-binary "@$STATE/ntfy.json" >/dev/null 2>&1 || true
+  curl -fsS -m 10 -X POST "$CORVID_NTFY_URL" \
+    -H "Title: $ntfy_title" -H "Priority: $prio" \
+    -H "Tags: $ntfy_tags" "${auth[@]}" \
+    --data-binary "@$STATE/ntfy.json" >/dev/null 2>&1 || true
 }
 
 # ── corvid_sync ───────────────────────────────────────────────────────────────

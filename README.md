@@ -149,8 +149,11 @@ silent fallback would just be the pinned-ID problem again, harder to see.
 
 When `CORVID_NTFY_URL` (an ntfy topic URL from `lib/corvid-site.sh`) is set, the
 end of every bird run also pushes a notification with the title `"<bird>:
-<status>"` and a body carrying the run detail, the finds count, the cost in USD
-and the last commit line. A failed run (a status outside the OK set) arrives as
+<status>"` and a plain-text body carrying the run detail, the finds count, the
+cost in USD and the last commit line. Because the POST goes to the full topic
+URL, ntfy takes the body as the message text and reads the title, priority and
+tags from HTTP headers; the body is sent as plain text (never as JSON) so it is
+displayed verbatim. A failed run (a status outside the OK set) arrives as
 priority `high` with a `warning` tag; a run that changed nothing is priority
 `low`; a run with finds gets default priority. An optional `CORVID_NTFY_TOKEN`
 is sent as an `Authorization: Bearer ...` header for a token-protected topic and
