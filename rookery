@@ -49,6 +49,7 @@ def _site(key: str, default: str) -> str:
 
 
 PROJECT = _site("CORVID_PROJECT", "corvid")
+NTFY_URL = _site("CORVID_NTFY_URL", "")
 STATE_FMT = str(HOME / f".local/state/{PROJECT}-{{bird}}")
 WORK_FMT = str(HOME / f"git/{PROJECT}-{{bird}}")
 FLEET_JSON = HOME / f".local/state/{PROJECT}-fleet.json"
@@ -316,6 +317,7 @@ def render(rows: list[dict], sel: int, msg: str = "") -> None:
     off = [r["bird"] for r in rows if r["enabled"] != "enabled"]
     print(f"{C['bold']}rookery{C['off']}  ·  {len(rows)} birds  ·  "
           f"{risky_n} hold Bash/Edit"
+          + (f"  ·  ntfy {C['grn']}on{C['off']}" if NTFY_URL else "")
           + (f"  ·  {C['yel']}{len(off)} disabled{C['off']}" if off else ""))
     print(f"{C['dim']}{'':2}{'BIRD':9}{'SCHEDULE':14}{'LAST':10}{'NEXT':6}"
           f"{'STATUS':11}{'COST':8}{'CONTAINMENT'}{C['off']}")

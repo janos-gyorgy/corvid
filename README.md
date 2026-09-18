@@ -147,6 +147,17 @@ you edit `lib/models.sh` and nothing else. Meanwhile every call carries
 family than it asked for warns on stderr and pings `CORVID_NTFY_URL` if set. A
 silent fallback would just be the pinned-ID problem again, harder to see.
 
+When `CORVID_NTFY_URL` (an ntfy topic URL from `lib/corvid-site.sh`) is set, the
+end of every bird run also pushes a notification with the title `"<bird>:
+<status>"` and a body carrying the run detail, the finds count, the cost in USD
+and the last commit line. A failed run (a status outside the OK set) arrives as
+priority `high` with a `warning` tag; a run that changed nothing is priority
+`low`; a run with finds gets default priority. An optional `CORVID_NTFY_TOKEN`
+is sent as an `Authorization: Bearer ...` header for a token-protected topic and
+is never echoed into the log. Unset or empty URL = nothing is sent. Like the n8n
+post, the request is best-effort: 10-second timeout, errors ignored, so it can
+never slow or fail a run.
+
 Without a tier an agent inherits the CLI default, which is whatever the operator
 set for their own interactive sessions. That default silently moving every agent
 is why tiers exist. The usage ledger records the model a run actually used next

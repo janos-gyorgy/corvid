@@ -148,6 +148,7 @@ corvid_on_exit() {
     corvid_hook_on_exit
   else
     [ "$DRY_RUN" = 1 ] || corvid_notify
+    [ "$DRY_RUN" = 1 ] || corvid_ntfy_notify
   fi
   return 0
 }
@@ -187,6 +188,56 @@ json.dump(p, sys.stdout)
 PY
   curl -fsS -m 10 -X POST "$WEBHOOK" -H 'Content-Type: application/json' \
     --data-binary "@$STATE/notify.json" >/dev/null 2>&1 || true
+}
+
+# ── corvid_ntfy_notify ────────────────────────────────────────────────────────
+# Push the run outcome to an ntfy topic (CORVID_NTFY_URL, the full topic URL
+# from corvid-site.sh) alongside the n8n webhook. Title "<bird>: <status>"; the
+# body carries the run detail, the finds count, the cost in USD and the last
+# commit line. Priority: a status OUTSIDE the OK set (a failed run) is high with
+# a warning tag; a run that changed nothing is low; anything with finds is the
+# default. Optional CORVID_NTFY_TOKEN is sent as a Bearer token and is never
+# echoed. Best-effort and non-blocking exactly like the n8n post above: 10s
+# timeout, errors ignored, so a notification can never fail or slow the run.
+corvid_ntfy_notify() {
+  [ -n "${CORVID_NTFY_URL:-}" ] || return 0
+  local st="${STATUS:-failed}" commit prio="default" tags=""
+  # The OK set mirrors rookery's OK_STATUS -- anything outside it is a failure.
+  case "$st" in
+    ok|finds|spark|pushed|nothing|nochanges|clean|changed) : ;;
+    *) prio="high"; tags="warning" ;;
+  esac
+  case "$st" in nothing|nochanges) prio="low" ;; esac
+  commit="$(git -C "$WORK" --no-pager log --oneline -1 2>/dev/null || echo n/a)"
+  # DETAIL can hold model-chosen text, so the body and title go through a JSON
+  # encoder rather than being pasted together (same discipline as corvid_notify).
+  python3 - "$BIRD" "$st" "$DETAIL" "${FINDS:-0}" "${RUN_COST_USD:-0}" \
+           "$commit" "$prio" "$tags" > "$STATE/ntfy.json" <<'PY' || return 0
+import json, sys
+bird, st, detail, finds, cost, commit, prio, tags = sys.argv[1:9]
+def num(v):
+    v = str(v).strip()
+    try:
+        return float(v) if "." in v else int(v)
+    except ValueError:
+        return 0
+bits = [detail] if detail else []
+bits.append("finds: {0}".format(num(finds)))
+bits.append("cost: ${0}".format(num(cost)))
+if commit and commit != "n/a":
+    bits.append(commit)
+p = {"title": "{0}: {1}".format(bird, st), "message": "\n".join(bits),
+     "priority": prio}
+if tags:
+    p["tags"] = [tags]
+json.dump(p, sys.stdout)
+PY
+  local auth=()
+  if [ -n "${CORVID_NTFY_TOKEN:-}" ]; then
+    auth=(-H "Authorization: Bearer $CORVID_NTFY_TOKEN")
+  fi
+  curl -fsS -m 10 -X POST "$CORVID_NTFY_URL" -H 'Content-Type: application/json' \
+    "${auth[@]}" --data-binary "@$STATE/ntfy.json" >/dev/null 2>&1 || true
 }
 
 # ── corvid_sync ───────────────────────────────────────────────────────────────

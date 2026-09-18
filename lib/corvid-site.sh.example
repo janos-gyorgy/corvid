@@ -7,9 +7,16 @@ CORVID_REMOTE="git@github.com:you/your-repo.git"   # REQUIRED — where birds pu
 CORVID_EMAIL_DOMAIN=localhost               # git author domain for bird commits
 CORVID_QDIR_BASE=quarantine                 # output root; keep it out of whatever indexes your repo
 
-# Optional. ntfy topic URL for fleet-plumbing warnings (a run landed on a
-# different model family than its CORVID_TIER asked for). Unset = stderr only.
+# Optional. ntfy push notifications — the topic URL where run-outcome
+# notifications are sent at the end of every bird run (title "<bird>: <status>",
+# with the detail, finds count, cost in USD and last commit in the body). Also
+# used for fleet-plumbing warnings (a run landed on a different model family than
+# its CORVID_TIER asked for). Unset or empty = no notification is sent.
 # CORVID_NTFY_URL=https://ntfy.sh/your-private-topic
+
+# Optional. Value sent to ntfy as an HTTP `Authorization: Bearer ...` header (for
+# a token-protected topic). Never echoed into the log. Unset = no auth header.
+# CORVID_NTFY_TOKEN=...
 
 # Optional. Called as: <cmd> <qdir> <qfile> before staging, to drop repeats.
 # CORVID_DEDUP_CMD="python3 /path/to/dedup.py"
